@@ -593,15 +593,21 @@ class ChannelContext:
 
     `close()` should be called on the object when it is no longer
     in use.
+
+    Args:
+      target: The server address
+      iface: Bind this channel to a particular device, socket SO_BINDTODEVICE
     """
-    def __init__(self, target: Optional[str] = None) -> None:
+
+    def __init__(self, target: Optional[str] = None, iface: Optional[str] = None) -> None:
         self.channel = None
         self.target = "192.168.100.1:9200" if target is None else target
+        self.channel_arguments = [("grpc.socket_device", iface)] if iface else None
 
     def get_channel(self) -> Tuple[grpc.Channel, bool]:
         reused = True
         if self.channel is None:
-            self.channel = grpc.insecure_channel(self.target)
+            self.channel = grpc.insecure_channel(self.target, options=self.channel_arguments)
             reused = False
         return self.channel, reused
 
