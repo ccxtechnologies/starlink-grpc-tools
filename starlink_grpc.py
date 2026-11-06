@@ -33,9 +33,16 @@ This group holds information about the current state of the user terminal.
     version.
 : **software_version** : A string identifying the software currently installed
     on the user terminal.
+: **software_update_state** : A string describing the state of software update,
+    or None if not reported by the user terminal. Currently, one of:
+    "SOFTWARE_UPDATE_STATE_UNKNOWN", "IDLE", "FETCHING", "PRE_CHECK",
+    "WRITING", "POST_CHECK", "REBOOT_REQUIRED", "DISABLED", and "FAULTED".
 : **state** : As string describing the current connectivity state of the user
-    terminal. One of: "UNKNOWN", "CONNECTED", "BOOTING", "SEARCHING", "STOWED",
-    "THERMAL_SHUTDOWN", "NO_SATS", "OBSTRUCTED", "NO_DOWNLINK", "NO_PINGS".
+    terminal. Currently, one of: "UNKNOWN", "CONNECTED", "BOOTING",
+    "SEARCHING", "STOWED", "THERMAL_SHUTDOWN", "NO_SATS", "OBSTRUCTED",
+    "NO_DOWNLINK", "NO_PINGS", "ACTUATOR_ACTIVITY", "CABLE_TEST", "SLEEPING",
+    "SKY_SEARCH", and "INHIBIT_RF". Other than "CONNECTED", which indicates
+    non-outage, this list is subject to change.
 : **uptime** : The amount of time, in seconds, since the user terminal last
     rebooted.
 : **snr** : Most recent sample value. See bulk history data for detail.
@@ -90,6 +97,18 @@ This group holds information about the current state of the user terminal.
     use GPS for position data if and when it becomes ready.
 : **gps_sats** : Number of satellites actively being used.
 
+Software update detail status data
+----------------------------------
+This group holds additional detail regarding software updates reported by the
+user terminal.
+
+: **software_update_progress** : Software update progress from 0 to 1, or None
+    if not reported by the user terminal.
+: **software_update_reboot_ready** : Boolean indicating whether or not the
+    terminal reports that it is ready to reboot for a software update.
+: **seconds_until_software_update_reboot_possible** : Seconds until a software
+    update reboot is possible, or None if not reported by the user terminal.
+
 Obstruction detail status data
 ------------------------------
 This group holds additional detail regarding the specific areas the user
@@ -123,9 +142,15 @@ sum of all *wedges_fraction_obstructed* elements.
 Alert detail status data
 ------------------------
 This group holds the current state of each individual alert reported by the
-user terminal. Note that more alerts may be added in the future. See also
-*alerts* in the general status data for a bit field combining them if you
-need a set of fields that will not change size in the future.
+user terminal. Note that more alerts may be added in the future and existing
+alerts may stop being reported if they become obsoleted by the user terminal
+firmware.
+
+See also *alerts* in the general status data for a bit field combining them if
+you need a set of fields that will not change size in the future. The bit masks
+noted below should remain valid even if alerts are added or removed, but this
+is contingent on the user terminal firmware not doing something broken to the
+service protocol.
 
 Descriptions on these are vague due to them being difficult to confirm by
 their nature, but the field names are pretty self-explanatory.
@@ -143,6 +168,7 @@ their nature, but the field names are pretty self-explanatory.
 : **alert_slow_ethernet_speeds** : Alert corresponding with bit 5 (bit mask
     32) in *alerts*.
 : **alert_roaming** : Alert corresponding with bit 6 (bit mask 64) in *alerts*.
+    **OBSOLETE**: This alert is no longer generated.
 : **alert_install_pending** : Alert corresponding with bit 7 (bit mask 128) in
     *alerts*.
 : **alert_is_heating** : Alert corresponding with bit 8 (bit mask 256) in
@@ -153,22 +179,31 @@ their nature, but the field names are pretty self-explanatory.
     1024) in *alerts*.
 : **alert_moving_while_not_mobile** : Alert corresponding with bit 11 (bit mask
     2048) in *alerts*.
+    **OBSOLETE**: This alert is no longer generated.
 : **alert_moving_fast_while_not_aviation** : Alert corresponding with bit 12
     (bit mask 4096) in *alerts*.
-    **OBSOLETE**: This alert is no longer generated, presumably in preference
-    of *alert_moving_too_fast_for_policy*.
+    **OBSOLETE**: This alert is no longer generated.
 : **alert_dbf_telem_stale** : Alert corresponding with bit 13 (bit mask 8192)
     in *alerts*.
 : **alert_moving_too_fast_for_policy** : Alert corresponding with bit 14 (bit
     mask 16384) in *alerts*.
+    **OBSOLETE**: This alert is no longer generated.
 : **alert_low_motor_current** : Alert corresponding with bit 15 (bit mask
     32768) in *alerts*.
-: **lower_signal_than_predicted** : Alert corresponding with bit 16 (bit mask
-    65536) in *alerts*.
-: **slow_ethernet_speeds_100** : Alert corresponding with bit 17 (bit mask
-    131072) in *alerts*.
-: **obstruction_map_reset** : Alert corresponding with bit 18 (bit mask
+: **alert_lower_signal_than_predicted** : Alert corresponding with bit 16 (bit
+    mask 65536) in *alerts*.
+: **alert_slow_ethernet_speeds_100** : Alert corresponding with bit 17 (bit
+    mask 131072) in *alerts*.
+: **alert_obstruction_map_reset** : Alert corresponding with bit 18 (bit mask
     262144) in *alerts*.
+: **alert_dish_water_detected** : Alert corresponding with bit 19 (bit mask
+    524288) in *alerts*.
+: **alert_router_water_detected** : Alert corresponding with bit 20 (bit mask
+    1048576) in *alerts*.
+: **alert_upsu_router_port_slow** : Alert corresponding with bit 21 (bit mask
+    2097152) in *alerts*.
+: **alert_no_ethernet_link** : Alert corresponding with bit 22 (bit mask
+    4194304) in *alerts*.
 
 Location data
 -------------
@@ -405,15 +440,19 @@ from typing_extensions import TypedDict, get_args
 import grpc
 
 try:
-    from yagrc import importer, reflector
-    importer.add_lazy_packages(["spacex_api.device"])
-    imports_pending = True
-except (ImportError, AttributeError):
+    # Use generated protocol modules if present
+    from spacex_api.device.device_pb2_grpc import DeviceStub
+    from spacex_api.device.device_pb2 import Request
+    from spacex_api.device.dish_pb2 import DishAlerts, DishOutage
     imports_pending = False
-
-from spacex_api.device import device_pb2
-from spacex_api.device import device_pb2_grpc
-from spacex_api.device import dish_pb2
+except ImportError:
+    # Otherwise, use yagrc to pull protocol classes via reflection
+    from yagrc import reflector
+    DeviceStub = None
+    Request = None
+    DishAlerts = None
+    DishOutage = None
+    imports_pending = True
 
 # Max wait time for gRPC request completion, in seconds. This is just to
 # prevent hang if the connection goes dead without closing.
@@ -424,36 +463,44 @@ HISTORY_FIELDS = ("pop_ping_drop_rate", "pop_ping_latency_ms", "downlink_through
 
 StatusDict = TypedDict(
     "StatusDict", {
-        "id": str,
-        "hardware_version": str,
-        "software_version": str,
+        "id": Optional[str],
+        "hardware_version": Optional[str],
+        "software_version": Optional[str],
         "state": str,
-        "uptime": int,
+        "uptime": Optional[int],
         "snr": Optional[float],
-        "seconds_to_first_nonempty_slot": float,
-        "pop_ping_drop_rate": float,
-        "downlink_throughput_bps": float,
-        "uplink_throughput_bps": float,
-        "pop_ping_latency_ms": float,
+        "seconds_to_first_nonempty_slot": Optional[float],
+        "pop_ping_drop_rate": Optional[float],
+        "downlink_throughput_bps": Optional[float],
+        "uplink_throughput_bps": Optional[float],
+        "pop_ping_latency_ms": Optional[float],
         "alerts": int,
-        "fraction_obstructed": float,
-        "currently_obstructed": bool,
+        "fraction_obstructed": Optional[float],
+        "currently_obstructed": Optional[bool],
         "seconds_obstructed": Optional[float],
         "obstruction_duration": Optional[float],
         "obstruction_interval": Optional[float],
-        "direction_azimuth": float,
-        "direction_elevation": float,
-        "is_snr_above_noise_floor": bool,
-        "gps_ready": bool,
-        "gps_enabled": bool,
-        "gps_sats": int,
+        "direction_azimuth": Optional[float],
+        "direction_elevation": Optional[float],
+        "is_snr_above_noise_floor": Optional[bool],
+        "gps_ready": Optional[bool],
+        "gps_enabled": Optional[bool],
+        "gps_sats": Optional[int],
+        "software_update_state": Optional[str],
+    })
+
+SoftwareUpdateDict = TypedDict(
+    "SoftwareUpdateDict", {
+        "software_update_progress": Optional[float],
+        "software_update_reboot_ready": Optional[bool],
+        "seconds_until_software_update_reboot_possible": Optional[int],
     })
 
 ObstructionDict = TypedDict(
     "ObstructionDict", {
         "wedges_fraction_obstructed[]": Sequence[Optional[float]],
         "raw_wedges_fraction_obstructed[]": Sequence[Optional[float]],
-        "valid_s": float,
+        "valid_s": Optional[float],
     })
 
 AlertDict = Dict[str, bool]
@@ -568,20 +615,48 @@ def _field_types(hint_type):
     return list(xlate(val) for val in get_type_hints(hint_type).values())
 
 
-def resolve_imports(channel: grpc.Channel):
+def _enum_name(message, field_name: str) -> Optional[str]:
+    value = None
     try:
-        importer.resolve_lazy_imports(channel)
-    except reflector.ServiceError:
-        # "temporary" backwards compatibility hack: try old package name
-        bchack_importer = importer.GrpcImporter()
-        bchack_importer.configure(channel, filenames=["spacex/api/device/device.proto", "spacex/api/device/dish.proto"])
-        global device_pb2
-        global device_pb2_grpc
-        global dish_pb2
-        from spacex.api.device import device_pb2
-        from spacex.api.device import device_pb2_grpc
-        from spacex.api.device import dish_pb2
-        # end backwards compatibility hack
+        value = getattr(message, field_name)
+        field = message.DESCRIPTOR.fields_by_name[field_name]
+        enum_value = field.enum_type.values_by_number.get(value)
+        return enum_value.name if enum_value is not None else str(value)
+    except AttributeError:
+        return None
+    except (KeyError, TypeError, ValueError):
+        return None if value is None else str(value)
+
+
+def resolve_imports(channel: grpc.Channel):
+    """Resolve protocol classes using grpc reflection.
+
+    This is primarily meant for internal use and will be called on the first
+    operation that needs it.
+
+    Args:
+        channel (grpc.Channel): Channel to reflection server.
+
+    Raises:
+        grpc.RpcError: Communication error.
+        GrpcError: Reflection service error.
+    """
+    grclient = reflector.GrpcReflectionClient()
+    try:
+        grclient.load_protocols(channel, symbols=["SpaceX.API.Device.Device"])
+
+        global DeviceStub
+        global Request
+        global DishAlerts
+        global DishOutage
+
+        DeviceStub = grclient.service_stub_class("SpaceX.API.Device.Device")
+        Request = grclient.message_class("SpaceX.API.Device.Request")
+        DishAlerts = grclient.message_class("SpaceX.API.Device.DishAlerts")
+        DishOutage = grclient.message_class("SpaceX.API.Device.DishOutage")
+    except (reflector.ServiceError, KeyError) as e:
+        raise GrpcError("Reflection service error") from e
+
     global imports_pending
     imports_pending = False
 
@@ -638,7 +713,7 @@ class ChannelContext:
 
 
 def call_with_channel(function, *args, context: Optional[ChannelContext] = None, **kwargs):
-    """Call a function with a channel object.
+    """Call a function with a `grpc.Channel` object.
 
     Args:
         function: Function to call with channel as first arg.
@@ -646,6 +721,11 @@ def call_with_channel(function, *args, context: Optional[ChannelContext] = None,
         context (ChannelContext): Optionally provide a channel for (re)use.
             If not set, a new default channel will be used and then closed.
         kwargs: Additional keyword args to pass to function.
+
+    Raises:
+        Nothing by itself, but will pass through any exception thrown by
+        `function`, which will probably include `grpc.RpcError` and may include
+        `GrpcError`, `AttributeError`, and `ValueError` when using reflection.
     """
     if context is None:
         with grpc.insecure_channel("192.168.100.1:9200") as channel:
@@ -672,8 +752,14 @@ def status_field_names(context: Optional[ChannelContext] = None):
             with reflection service.
 
     Returns:
-        A tuple with 3 lists, with status data field names, obstruction detail
-        field names, and alert detail field names, in that order.
+        A tuple with 4 lists, with status data field names, obstruction detail
+        field names, alert detail field names, and software update detail field
+        names, in that order.
+
+        Note:
+            Additional lists may be added to this tuple in the future with
+            additional data groups, so it not recommended for the caller to
+            assume exactly 4 elements.
 
     Raises:
         GrpcError: No user terminal is currently available to resolve imports
@@ -686,12 +772,13 @@ def status_field_names(context: Optional[ChannelContext] = None):
             raise GrpcError(e) from e
     alert_names = []
     try:
-        for field in dish_pb2.DishAlerts.DESCRIPTOR.fields:
+        for field in DishAlerts.DESCRIPTOR.fields:
             alert_names.append("alert_" + field.name)
     except AttributeError:
         pass
 
-    return _field_names(StatusDict), _field_names(ObstructionDict), alert_names
+    return (_field_names(StatusDict), _field_names(ObstructionDict),
+            alert_names, _field_names(SoftwareUpdateDict))
 
 
 def status_field_types(context: Optional[ChannelContext] = None):
@@ -705,8 +792,14 @@ def status_field_types(context: Optional[ChannelContext] = None):
             with reflection service.
 
     Returns:
-        A tuple with 3 lists, with status data field types, obstruction detail
-        field types, and alert detail field types, in that order.
+        A tuple with 4 lists, with status data field types, obstruction detail
+        field types, alert detail field types, and software update detail field
+        types, in that order.
+
+        Note:
+            Additional lists may be added to this tuple in the future with
+            additional data groups, so it not recommended for the caller to
+            assume exactly 4 elements.
 
     Raises:
         GrpcError: No user terminal is currently available to resolve imports
@@ -719,10 +812,11 @@ def status_field_types(context: Optional[ChannelContext] = None):
             raise GrpcError(e) from e
     num_alerts = 0
     try:
-        num_alerts = len(dish_pb2.DishAlerts.DESCRIPTOR.fields)
+        num_alerts = len(DishAlerts.DESCRIPTOR.fields)
     except AttributeError:
         pass
-    return (_field_types(StatusDict), _field_types(ObstructionDict), [bool] * num_alerts)
+    return (_field_types(StatusDict), _field_types(ObstructionDict),
+            [bool] * num_alerts, _field_types(SoftwareUpdateDict))
 
 
 def get_status(context: Optional[ChannelContext] = None):
@@ -739,12 +833,13 @@ def get_status(context: Optional[ChannelContext] = None):
         AttributeError, ValueError: Protocol error. Either the target is not a
             Starlink user terminal or the grpc protocol has changed in a way
             this module cannot handle.
+        GrpcError: Reflection service error.
     """
     def grpc_call(channel):
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(get_status={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(get_status={}), timeout=REQUEST_TIMEOUT)
         return response.dish_get_status
 
     return call_with_channel(grpc_call, context=context)
@@ -772,7 +867,8 @@ def get_id(context: Optional[ChannelContext] = None) -> str:
 
 
 def status_data(
-        context: Optional[ChannelContext] = None) -> Tuple[StatusDict, ObstructionDict, AlertDict]:
+        context: Optional[ChannelContext] = None
+) -> Tuple[StatusDict, ObstructionDict, AlertDict, SoftwareUpdateDict]:
     """Fetch current status data.
 
     Args:
@@ -780,9 +876,14 @@ def status_data(
             across repeated calls.
 
     Returns:
-        A tuple with 3 dicts, mapping status data field names, obstruction
-        detail field names, and alert detail field names to their respective
-        values, in that order.
+        A tuple with 4 dicts, mapping status data field names, obstruction
+        detail field names, alert detail field names, and software update detail
+        field names to their respective values, in that order.
+
+        Note:
+            Additional dicts may be added to this tuple in the future with
+            additional data groups, so it not recommended for the caller to
+            assume exactly 4 elements.
 
     Raises:
         GrpcError: Failed getting status info from the Starlink user terminal.
@@ -794,12 +895,12 @@ def status_data(
 
     try:
         if status.HasField("outage"):
-            if status.outage.cause == dish_pb2.DishOutage.Cause.NO_SCHEDULE:
+            if status.outage.cause == DishOutage.Cause.NO_SCHEDULE:
                 # Special case translate this to equivalent old name
                 state = "SEARCHING"
             else:
                 try:
-                    state = dish_pb2.DishOutage.Cause.Name(status.outage.cause)
+                    state = DishOutage.Cause.Name(status.outage.cause)
                 except ValueError:
                     # Unlikely, but possible if dish is running newer firmware
                     # than protocol data pulled via reflection
@@ -812,7 +913,7 @@ def status_data(
     # More alerts may be added in future, so in addition to listing them
     # individually, provide a bit field based on field numbers of the
     # DishAlerts message.
-    alerts = {}
+    alerts: AlertDict = {}
     alert_bits = 0
     try:
         for field in status.alerts.DESCRIPTOR.fields:
@@ -838,7 +939,15 @@ def status_data(
     device_info = getattr(status, "device_info", None)
     gps_stats = getattr(status, "gps_stats", None)
     inhibit_gps = getattr(gps_stats, "inhibit_gps", None)
-    return {
+    software_update_stats = getattr(status, "software_update_stats", None)
+    software_update_progress = None
+    try:
+        if status.HasField("software_update_stats"):
+            software_update_progress = getattr(software_update_stats, "software_update_progress", None)
+    except (AttributeError, ValueError):
+        pass
+
+    status_data_dict: StatusDict = {
         "id": getattr(device_info, "id", None),
         "hardware_version": getattr(device_info, "hardware_version", None),
         "software_version": getattr(device_info, "software_version", None),
@@ -862,11 +971,20 @@ def status_data(
         "gps_ready": getattr(gps_stats, "gps_valid", None),
         "gps_enabled": None if inhibit_gps is None else not inhibit_gps,
         "gps_sats": getattr(gps_stats, "gps_sats", None),
-    }, {
+        "software_update_state": _enum_name(status, "software_update_state"),
+    }
+    software_update_detail: SoftwareUpdateDict = {
+        "software_update_progress": software_update_progress,
+        "software_update_reboot_ready": getattr(status, "swupdate_reboot_ready", None),
+        "seconds_until_software_update_reboot_possible": getattr(
+            status, "seconds_until_swupdate_reboot_possible", None),
+    }
+    obstruction_detail: ObstructionDict = {
         "wedges_fraction_obstructed[]": [None] * 12,  # obsoleted in grpc service
         "raw_wedges_fraction_obstructed[]": [None] * 12,  # obsoleted in grpc service
         "valid_s": getattr(obstruction_stats, "valid_s", None),
-    }, alerts
+    }
+    return status_data_dict, obstruction_detail, alerts, software_update_detail
 
 
 def location_field_names():
@@ -903,12 +1021,13 @@ def get_location(context: Optional[ChannelContext] = None):
         AttributeError, ValueError: Protocol error. Either the target is not a
             Starlink user terminal or the grpc protocol has changed in a way
             this module cannot handle.
+        GrpcError: Reflection service error.
     """
     def grpc_call(channel):
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(get_location={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(get_location={}), timeout=REQUEST_TIMEOUT)
         return response.get_location
 
     return call_with_channel(grpc_call, context=context)
@@ -1042,12 +1161,13 @@ def get_history(context: Optional[ChannelContext] = None):
         AttributeError, ValueError: Protocol error. Either the target is not a
             Starlink user terminal or the grpc protocol has changed in a way
             this module cannot handle.
+        GrpcError: Reflection service error.
     """
     def grpc_call(channel: grpc.Channel):
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(get_history={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(get_history={}), timeout=REQUEST_TIMEOUT)
         return response.dish_get_history
 
     return call_with_channel(grpc_call, context=context)
@@ -1542,12 +1662,13 @@ def get_obstruction_map(context: Optional[ChannelContext] = None):
         AttributeError, ValueError: Protocol error. Either the target is not a
             Starlink user terminal or the grpc protocol has changed in a way
             this module cannot handle.
+        GrpcError: Reflection service error.
     """
     def grpc_call(channel: grpc.Channel):
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(dish_get_obstruction_map={}),
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(dish_get_obstruction_map={}),
                                timeout=REQUEST_TIMEOUT)
         return response.dish_get_obstruction_map
 
@@ -1600,8 +1721,8 @@ def reset_obstruction_map(context: Optional[ChannelContext] = None):
     def grpc_call(channel: grpc.Channel) -> None:
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        stub.Handle(device_pb2.Request(dish_clear_obstruction_map={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        stub.Handle(Request(dish_clear_obstruction_map={}), timeout=REQUEST_TIMEOUT)
         # response is empty message in this case, so just ignore it
 
     try:
@@ -1625,8 +1746,8 @@ def reboot(context: Optional[ChannelContext] = None) -> None:
     def grpc_call(channel: grpc.Channel) -> None:
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        stub.Handle(device_pb2.Request(reboot={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        stub.Handle(Request(reboot={}), timeout=REQUEST_TIMEOUT)
         # response is empty message in this case, so just ignore it
 
     try:
@@ -1652,8 +1773,8 @@ def set_stow_state(unstow: bool = False, context: Optional[ChannelContext] = Non
     def grpc_call(channel: grpc.Channel) -> None:
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        stub.Handle(device_pb2.Request(dish_stow={"unstow": unstow}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        stub.Handle(Request(dish_stow={"unstow": unstow}), timeout=REQUEST_TIMEOUT)
         # response is empty message in this case, so just ignore it
 
     try:
@@ -1678,18 +1799,18 @@ def get_sleep_config(context: Optional[ChannelContext] = None) -> Tuple[int, int
 
     Raises:
         GrpcError: Communication or service error.
-        AttributeError, ValueError: Protocol error. Either the target is not a
-            Starlink user terminal or the grpc protocol has changed in a way
-            this module cannot handle.
     """
     def grpc_call(channel: grpc.Channel):
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(dish_get_config={}), timeout=REQUEST_TIMEOUT)
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(dish_get_config={}), timeout=REQUEST_TIMEOUT)
         return response.dish_get_config.dish_config
 
-    config = call_with_channel(grpc_call, context=context)
+    try:
+        config = call_with_channel(grpc_call, context=context)
+    except (AttributeError, ValueError, grpc.RpcError) as e:
+        raise GrpcError(e) from e
 
     return (config.power_save_start_minutes, config.power_save_duration_minutes,
             config.power_save_mode)
@@ -1724,8 +1845,8 @@ def set_sleep_config(start: int,
     def grpc_call(channel: grpc.Channel) -> None:
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        stub.Handle(device_pb2.Request(
+        stub = DeviceStub(channel)
+        stub.Handle(Request(
             dish_power_save={
                 "power_save_start_minutes": start,
                 "power_save_duration_minutes": duration,
@@ -1741,7 +1862,11 @@ def set_sleep_config(start: int,
 
 
 def set_gps_config(enable: bool, context: Optional[ChannelContext] = None) -> bool:
-    """Set sleep mode configuration.
+    """Set GPS usage configuration.
+
+    Note:
+        This configuration resets to GPS enabled on reboot of the user
+        terminal.
 
     Args:
         enable (bool): Whether or not to use GPS for position data.
@@ -1759,8 +1884,8 @@ def set_gps_config(enable: bool, context: Optional[ChannelContext] = None) -> bo
     def grpc_call(channel: grpc.Channel) -> None:
         if imports_pending:
             resolve_imports(channel)
-        stub = device_pb2_grpc.DeviceStub(channel)
-        response = stub.Handle(device_pb2.Request(dish_inhibit_gps={"inhibit_gps": not enable}),
+        stub = DeviceStub(channel)
+        response = stub.Handle(Request(dish_inhibit_gps={"inhibit_gps": not enable}),
                                timeout=REQUEST_TIMEOUT)
         return not response.dish_inhibit_gps.inhibit_gps
 

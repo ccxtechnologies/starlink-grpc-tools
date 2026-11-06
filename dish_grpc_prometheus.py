@@ -53,6 +53,9 @@ METRICS_INFO = {
     "status_uplink_throughput_bps": MetricInfo(),
     "status_pop_ping_latency_ms": MetricInfo(),
     "status_alerts": MetricInfo(),
+    "status_software_update_progress": MetricInfo(),
+    "status_software_update_reboot_ready": MetricInfo(),
+    "status_seconds_until_software_update_reboot_possible": MetricInfo(),
     "status_fraction_obstructed": MetricInfo(),
     "status_currently_obstructed": MetricInfo(),
     "status_seconds_obstructed": MetricInfo(),
@@ -81,6 +84,14 @@ METRICS_INFO = {
     "status_alert_lower_signal_than_predicted": MetricInfo(),
     "ping_stats_samples": MetricInfo(kind="counter"),
     "ping_stats_end_counter": MetricInfo(kind="counter"),
+    "ping_stats_total_ping_drop": MetricInfo(kind="counter"),
+    "ping_stats_count_full_ping_drop": MetricInfo(kind="counter"),
+    "ping_stats_count_obstructed": MetricInfo(kind="counter"),
+    "ping_stats_total_obstructed_ping_drop": MetricInfo(kind="counter"),
+    "ping_stats_count_full_obstructed_ping_drop": MetricInfo(kind="counter"),
+    "ping_stats_count_unscheduled": MetricInfo(kind="counter"),
+    "ping_stats_total_unscheduled_ping_drop": MetricInfo(kind="counter"),
+    "ping_stats_count_full_unscheduled_ping_drop": MetricInfo(kind="counter"),
     "usage_download_usage": MetricInfo(unit="bytes", kind="counter"),
     "usage_upload_usage": MetricInfo(unit="bytes", kind="counter"),
     "power_latest_power": MetricInfo(),
@@ -102,6 +113,20 @@ STATE_VALUES = [
     "NO_DOWNLINK",
     "NO_PINGS",
     "DISH_UNREACHABLE",
+]
+
+# Software update states are derived from protocol data at runtime and may
+# change with user terminal firmware.
+SOFTWARE_UPDATE_STATE_VALUES = [
+    "SOFTWARE_UPDATE_STATE_UNKNOWN",
+    "IDLE",
+    "FETCHING",
+    "PRE_CHECK",
+    "WRITING",
+    "POST_CHECK",
+    "REBOOT_REQUIRED",
+    "DISABLED",
+    "FAULTED",
 ]
 
 
@@ -160,7 +185,41 @@ def parse_args():
     group.add_argument("--address", default="0.0.0.0", help="IP address to listen on")
     group.add_argument("--port", default=8080, type=int, help="Port to listen on")
 
-    return dish_common.run_arg_parser(parser, modes=["status", "alert_detail", "usage", "location", "power"])
+    return dish_common.run_arg_parser(
+        parser,
+        modes=[
+            "status", "software_update_detail", "alert_detail", "usage", "location", "power",
+            "ping_drop"
+        ])
+
+
+# Metrics that are only collected when a specific status data group is selected.
+# Any other "status_" metric comes from the "status" mode itself.
+LOCATION_METRICS = frozenset(["status_latitude", "status_longitude", "status_altitude"])
+SOFTWARE_UPDATE_DETAIL_METRICS = frozenset([
+    "status_software_update_progress",
+    "status_software_update_reboot_ready",
+    "status_seconds_until_software_update_reboot_possible",
+])
+
+
+def is_metric_expected(name, modes):
+    """Whether the selected modes are expected to produce the given metric."""
+    if name in LOCATION_METRICS:
+        return "location" in modes
+    if name in SOFTWARE_UPDATE_DETAIL_METRICS:
+        return "software_update_detail" in modes
+    if name.startswith("status_alert_"):
+        return "alert_detail" in modes
+    if name.startswith("status_"):
+        return "status" in modes
+    if name.startswith("ping_stats_"):
+        return "ping_drop" in modes
+    if name.startswith("usage_"):
+        return "usage" in modes
+    if name.startswith("power_"):
+        return "power" in modes
+    return True
 
 
 def prometheus_export(opts, gstate):
@@ -170,12 +229,16 @@ def prometheus_export(opts, gstate):
         raw_data[category + "_" + name] = value
         pass
 
-    def data_add_sequencem(name, value, category, start):
+    def data_add_sequence(name, value, category, start):
         raise NotImplementedError("Did not expect sequence data")
 
     with gstate.lock:
         rc, status_ts, hist_ts = dish_common.get_data(opts, gstate, data_add_item,
-                                                      data_add_sequencem)
+                                                      data_add_sequence)
+
+    # use the timestamp from whichever data group was actually collected, so
+    # that a history stats mode (e.g. ping_drop) can be exported on its own
+    timestamp = status_ts if status_ts is not None else hist_ts
 
     metrics = []
 
@@ -184,28 +247,44 @@ def prometheus_export(opts, gstate):
     if "status_snr" in raw_data:
         del raw_data["status_snr"]
 
-    metrics.append(
-        Metric(
-            name="starlink_status_state",
-            timestamp=status_ts,
-            values=[
-                MetricValue(
-                    value=int(raw_data["status_state"] == state_value),
-                    labels={"state": state_value},
-                ) for state_value in STATE_VALUES
-            ],
-        ))
-    del raw_data["status_state"]
+    if "status_state" in raw_data:
+        metrics.append(
+            Metric(
+                name="starlink_status_state",
+                timestamp=timestamp,
+                values=[
+                    MetricValue(
+                        value=int(raw_data["status_state"] == state_value),
+                        labels={"state": state_value},
+                    ) for state_value in STATE_VALUES
+                ],
+            ))
+        del raw_data["status_state"]
+
+    if "status_software_update_state" in raw_data:
+        metrics.append(
+            Metric(
+                name="starlink_status_software_update_state",
+                timestamp=timestamp,
+                values=[
+                    MetricValue(
+                        value=int(raw_data["status_software_update_state"] == state_value),
+                        labels={"state": state_value},
+                    ) for state_value in SOFTWARE_UPDATE_STATE_VALUES
+                ],
+            ))
+        del raw_data["status_software_update_state"]
 
     info_metrics = ["status_id", "status_hardware_version", "status_software_version"]
     metrics_not_found = []
-    metrics_not_found.extend([x for x in info_metrics if x not in raw_data])
+    if "status" in opts.mode:
+        metrics_not_found.extend([x for x in info_metrics if x not in raw_data])
 
-    if len(metrics_not_found) < len(info_metrics):
+    if any(x in raw_data for x in info_metrics):
         metrics.append(
             Metric(
                 name="starlink_info",
-                timestamp=status_ts,
+                timestamp=timestamp,
                 values=[
                     MetricValue(
                         value=1,
@@ -222,24 +301,24 @@ def prometheus_export(opts, gstate):
             metrics.append(
                 Metric(
                     name=f"starlink_{name}{metric_info.unit}",
-                    timestamp=status_ts,
+                    timestamp=timestamp,
                     kind=metric_info.kind,
                     values=[MetricValue(value=float(raw_data.pop(name) or 0))],
                 ))
-        else:
+        elif is_metric_expected(name, opts.mode):
             metrics_not_found.append(name)
 
     metrics.append(
         Metric(
             name="starlink_exporter_unprocessed_metrics",
-            timestamp=status_ts,
+            timestamp=timestamp,
             values=[MetricValue(value=1, labels={"metric": name}) for name in raw_data],
         ))
 
     metrics.append(
         Metric(
             name="starlink_exporter_missing_metrics",
-            timestamp=status_ts,
+            timestamp=timestamp,
             values=[MetricValue(
                 value=1,
                 labels={"metric": name},
@@ -260,11 +339,12 @@ class MetricsRequestHandler(BaseHTTPRequestHandler):
         gstate = self.server.gstate
 
         content = prometheus_export(opts, gstate)
+        body = content.encode("utf-8")
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-type", "text/plain")
-        self.send_header("Content-Length", len(content))
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(content.encode())
+        self.wfile.write(body)
 
 
 def main():
